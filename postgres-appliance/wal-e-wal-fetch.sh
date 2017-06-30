@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+date
+
 prefetch=8
 
 AWS_INSTANCE_PROFILE=0
@@ -119,11 +121,11 @@ function s3_get() {
 
     if curl -s https://$HOST$FILE "${TOKEN_HEADER[@]}" -H "x-amz-content-sha256: $EMPTYHASH" -H "x-amz-date: $TIME" \
         -H "Authorization: AWS4-HMAC-SHA256 Credential=$AWS_ACCESS_KEY_ID/$DRSR, SignedHeaders=$SIGNED_HEADERS, Signature=$SIGNATURE" \
-        | lzop -dc > $destination && [[ ${PIPESTATUS[0]} == 0 ]]; then
-        local size=$(stat -c%s $destination)
-        [[ $? == 0 && $size == 16777216 ]] && return 0
+        | lzop -dc > $destination 2> /dev/null && [[ ${PIPESTATUS[0]} == 0 ]]; then
+        [[ -s $destination ]] && echo "$$ success $FILE" && return 0
     fi
     rm -f $destination
+    echo "$$ failed $FILE"
     return 1
 }
 
@@ -141,27 +143,43 @@ function generate_next_segments() {
     done
 }
 
-if [[ $prefetch > 0 ]]; then
-    readonly PREFETCHDIR=$(dirname $DESTINATION)/.wal-e/prefetch
+function try_to_promote_prefetched() {
+    local prefetched=$PREFETCHDIR/$SEGMENT
+    [[ -f $prefetched ]] \
+        && echo "$$ promoting $prefetched" \
+        && exec mv $prefetched $DESTINATION
+}
 
+echo "$$ $SEGMENT"
+
+readonly PREFETCHDIR=$(dirname $DESTINATION)/.wal-e/prefetch
+if [[ $prefetch > 0 && $SEGMENT =~ ^[0-9A-F]{24}$ ]]; then
     for s in $(generate_next_segments $SEGMENT $prefetch); do
+        running="$PREFETCHDIR/running/$s"
+        [[ -d $running || -f $PREFETCHDIR/$s ]] && continue
+
+        mkdir -p $running
         (
-            mkdir -p $PREFETCHDIR/running/$s
-            trap "rm -fr $PREFETCHDIR/running/$s" QUIT TERM EXIT
-            exec 200<$PREFETCHDIR/running/$s
-            flock -ne 200 || exit
-            TMPFILE=$(mktemp -p $PREFETCHDIR/running/$s)
+            trap "rm -fr $running" QUIT TERM EXIT
+            TMPFILE=$(mktemp -p $running)
+            echo "$$ prefetching $s"
             s3_get $s $TMPFILE && mv $TMPFILE $PREFETCHDIR/$s
         ) &
     done
 
     last_size=0
-    while true; do
-        [[ -f $PREFETCHDIR/$SEGMENT ]] && exec mv $PREFETCHDIR/$SEGMENT $DESTINATION
-        [[ -d $PREFETCHDIR/running/$SEGMENT ]] || break
+    while ! try_to_promote_prefetched; do
         size=$(du -bs $PREFETCHDIR/running/$SEGMENT 2> /dev/null | cut -f1)
-        [[ ${PIPESTATUS[0]} == 0 && $size > $last_size ]] || break
-        sleep 0.5
+        if [[ -z $size ]]; then
+            try_to_promote_prefetched || break
+        elif [[ $size > $last_size ]]; then
+            echo "($size > $last_size), sleeping 1"
+            last_size=$size
+            sleep 1
+        else
+            echo "size=$size, last_size=$last_size"
+            break
+        fi
     done
 fi
 
